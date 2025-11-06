@@ -1,0 +1,528 @@
+---
+title: "Estimativa de População por Localidade"
+subtitle: "PALHOÇA - SC"
+author: "Rose Marie P Caldas - Instituto Mapa"
+date: "`r Sys.Date()`"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-summary: "Mostrar código"
+    fig-width: 10
+    fig-height: 6
+    warning: false
+    message: false
+editor: visual
+# =========================================================
+# === PARÂMETROS DE ENTRADA ===
+# =========================================================
+params:
+  cod_municipio_ibge: "4211900"        # Código do Município (Ex: Palhoça)
+  nome_municipio: "PALHOÇA"            # Nome para títulos e saídas
+  caminho_enderecos: "42_SC/42_SC.csv" # Caminho do arquivo de endereços do IBGE
+  caminho_setores: "SC_setores_CD2022/SC_setores_CD2022.shp" # Caminho do shapefile dos setores
+  usar_localidade_tratada: FALSE       # TRUE para usar tratamento Jaro-Winkler, FALSE para usar localidade oficial
+# =========================================================
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readr)
+library(sf)
+library(stringdist)
+library(openxlsx)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+# Define o código do município e nome a partir dos parâmetros
+COD_MUN <- params$cod_municipio_ibge
+NOME_MUN <- params$nome_municipio
+
+#CRIAÇÃO DA PASTA DE SAÍDA
+PASTA_SAIDA <- "resultados"
+if (!dir.exists(PASTA_SAIDA)) {
+  dir.create(PASTA_SAIDA)
+}
+```
+
+## Introdução
+
+Este documento apresenta uma metodologia estatística para estimar a população residente em **Localidades (Bairros)** de municípios que possuem dados geográficos limitados. O processo combina o cadastro de endereços do IBGE (georreferenciado), que informa a Localidade reportada em campo, com a malha oficial dos setores censitários, que informa a população residente. O objetivo final é distribuir a população total de cada setor censitário de forma proporcional aos endereços dentro daquele setor, obtendo uma estimativa populacional para cada Localidade identificada.
+
+## Ler arquivo de endereços do IBGE
+
+Realiza a importação e o pré-processamento inicial do **Cadastro de Endereços para Fins Estatísticos (CEFE)** do IBGE. A etapa concentra-se em filtrar os registros para o município de interesse, selecionar as colunas essenciais (incluindo as coordenadas geográficas - LATITUDE e LONGITUDE) e converter os dados para o formato espacial (`sf`) necessário para a análise geográfica.
+
+```{r}
+# 1. Leitura do arquivo (Com base no seu diagnóstico)
+enderecos_raw <- read_delim(params$caminho_enderecos,
+                             delim = ";",
+                             locale = locale(encoding = "Latin1", decimal_mark = ",", grouping_mark = "."),
+                             col_types = cols(.default = col_character()))
+
+# 2. Seleção e Limpeza (Selecionando colunas essenciais primeiro)
+enderecos_raw <- enderecos_raw %>%
+  select(DSC_LOCALIDADE, LATITUDE, LONGITUDE, COD_ESPECIE, COD_MUNICIPIO, 
+         # Incluindo colunas adicionais que você pode precisar
+         COD_UNICO_ENDERECO, starts_with("COD_"), starts_with("CD_"), everything()) %>%
+  
+  # Remove colunas desnecessárias de complementos
+  select(-matches("VAL_COMP_ELEM|NOM_COMP_ELEM"),
+         -DSC_ESTABELECIMENTO,
+         -COD_INDICADOR_ESTAB_ENDERECO,
+         -COD_INDICADOR_CONST_ENDERECO,
+         -COD_INDICADOR_FINALIDADE_CONST)
+
+# 3. Filtrar pelo Município e Espécie
+enderecos_palhoca <- enderecos_raw %>%
+  filter(COD_MUNICIPIO == COD_MUN, COD_ESPECIE %in% c("1", "2"))
+
+# 4. Converte LAT/LONG e cria SF
+enderecos_palhoca <- enderecos_palhoca %>%
+  mutate(
+    LATITUDE = as.numeric(LATITUDE),
+    LONGITUDE = as.numeric(LONGITUDE)
+  ) %>%
+  filter(!is.na(LATITUDE), !is.na(LONGITUDE))
+
+# Transforma em sf
+enderecos_sf <- st_as_sf(enderecos_palhoca, coords = c("LONGITUDE", "LATITUDE"), crs = 4674)
+```
+
+## Ler malha dos setores censitários
+
+Nesta etapa, é feita a leitura da **Malha Digital dos Setores Censitários** (formato *Shapefile*), que contém as geometrias (polígonos) dos setores e a informação oficial da população (`v0001`) por setor. O arquivo é filtrado para reter apenas os setores pertencentes ao município em análise, servindo como a base geográfica e populacional para a estimativa.
+
+```{r}
+# Lê o shapefile usando o caminho do parâmetro
+setores <- st_read(params$caminho_setores, quiet = TRUE) %>%
+  filter(CD_MUN == COD_MUN)
+```
+
+## Identificar setor IBGE oficial para cada endereço
+
+O objetivo desta etapa é realizar a **Junção Espacial**. Cada ponto de endereço georreferenciado é associado ao setor censitário que o contém. Esta junção atribui a cada endereço informações oficiais do setor, como o código do setor, a Situação (Urbano/Rural) e os nomes oficiais de Bairro e Distrito. Neste ponto, também garantimos a padronização de todos os nomes de localidades para **caixa alta**, evitando contagens separadas devido a diferenças de capitalização, e recuperamos as coordenadas originais (`LATITUDE`/`LONGITUDE`) necessárias para o mapa de dispersão.
+
+```{r}
+
+# 1. Junção Espacial e Renomeação (Cria objeto temporário)
+enderecos_setor_temp <- st_join(enderecos_sf, setores, join = st_within) %>%
+  st_drop_geometry() %>%
+  rename(SETOR_IBGE_VALIDADO = CD_SETOR,
+         BAIRRO_CENSO_IBGE = NM_BAIRRO,
+         DISTRITO_CENSO = NM_DIST,
+         SITUACAO_SETOR = SITUACAO)
+
+# 2. Juntar as coordenadas (LATITUDE/LONGITUDE) de volta e criar o objeto final
+enderecos_setor <- enderecos_setor_temp %>%
+  left_join(
+    # Seleciona as coordenadas e o ID único do objeto original
+    enderecos_palhoca %>% select(COD_UNICO_ENDERECO, LATITUDE, LONGITUDE),
+    by = "COD_UNICO_ENDERECO"
+  )
+
+# 3. **PADRONIZAÇÃO EM CAIXA ALTA (Aplicada ao objeto final e completo)**
+enderecos_setor <- enderecos_setor %>%
+  mutate(
+    # Colunas do setor censitário
+    BAIRRO_CENSO_IBGE = toupper(BAIRRO_CENSO_IBGE),
+    DISTRITO_CENSO = toupper(DISTRITO_CENSO),
+    
+    # Coluna original do endereço (DSC_LOCALIDADE)
+    DSC_LOCALIDADE = toupper(DSC_LOCALIDADE)
+  )
+
+# 4. Filtra a população e a situação do setor (v0001 e SITUACAO_SETOR) para uso posterior
+pop_setor <- setores %>%
+  st_drop_geometry() %>%
+  select(SETOR_IBGE_VALIDADO = CD_SETOR, v0001, SITUACAO_SETOR = SITUACAO)
+```
+
+### Unificar Localidades (Priorizando Setor do IBGE)
+
+Aqui, a coluna final de **Localidade** a ser utilizada na análise é definida. É aplicada uma regra de prioridade: se o setor censitário possui um **Bairro Codificado (IBGE)**, este nome prevalece sobre o nome reportado originalmente no cadastro de endereços (`DSC_LOCALIDADE`). Isso assegura que, sempre que houver um limite territorial oficial do IBGE para a localidade, ele seja utilizado como referência
+
+```{r}
+# Cria a coluna DSC_LOCALIDADE_OFICIAL que será a base, priorizando o bairro do setor
+enderecos_setor <- enderecos_setor %>%
+  mutate(
+    DSC_LOCALIDADE_OFICIAL = ifelse(
+      !is.na(BAIRRO_CENSO_IBGE) & BAIRRO_CENSO_IBGE != "",
+      BAIRRO_CENSO_IBGE,
+      DSC_LOCALIDADE
+    )
+  )
+```
+
+## Tratar nomes de localidades não oficiais
+
+Esta seção implementa a lógica de **Tratamento de Strings**. Se ativado (parâmetro `usar_localidade_tratada: TRUE`), é utilizada a métrica de **Distância de Jaro-Winkler** para agrupar nomes de localidades que são semanticamente muito semelhantes (como erros de digitação, abreviações ou variações). O resultado final é a coluna `localidade_tratada`, que será usada para agrupar endereços que, embora grafados de maneiras diferentes, referem-se à mesma Localidade.
+
+```{r}
+# Função Jaro-Winkler
+agrupamento_localidades <- function(localidades, threshold = 0.2) {
+  # Implementação otimizada da função de agrupamento
+  ref <- localidades
+  tratados <- rep(NA_character_, length(localidades))
+  for (i in seq_along(localidades)) {
+    if (is.na(tratados[i])) {
+      # Trata NA's e vazios antes de calcular a distância (para ser mais robusto)
+      if (is.na(localidades[i]) || localidades[i] == "") {
+        next
+      }
+      similares <- stringdist::stringdistmatrix(localidades[i], ref, method = "jw") < threshold
+      tratados[similares] <- localidades[i]
+    }
+  }
+  return(tratados)
+}
+
+if (params$usar_localidade_tratada) {
+  enderecos_setor <- enderecos_setor %>%
+    mutate(localidade_tratada = agrupamento_localidades(DSC_LOCALIDADE_OFICIAL))
+} else {
+  # Se não for para tratar, a coluna 'localidade_tratada' é igual à oficial (sem tratamento de strings)
+  enderecos_setor <- enderecos_setor %>%
+    mutate(localidade_tratada = DSC_LOCALIDADE_OFICIAL)
+}
+```
+
+## Estimar população por localidade tratada
+
+Este é o núcleo da análise. A população residente de cada Localidade é estimada utilizando o **Método de Proporcionalidade de Endereços**. A população total de um setor censitário (`v0001`) é distribuída pelas localidades que o compõem, com base na proporção de endereços de cada localidade dentro daquele setor. O resultado é um *dataframe* final com a população estimada para cada combinação de Localidade, Distrito e Situação (Urbano/Rural).
+
+**População Estimada:**
+
+$$
+População estimada = \frac{n}{N} \times P
+$$
+
+Onde:
+
+-   *n* = número de endereços da localidade
+-   *N* = total de endereços no setor
+-   *P* = população total do setor (`v0001`)
+-   O resultado é arredondado para o número inteiro mais próximo.
+
+```{r}
+# Define o nome da coluna de localidade que será usada no agrupamento final
+COLUNA_LOCALIDADE_FINAL <- ifelse(params$usar_localidade_tratada, "localidade_tratada", "DSC_LOCALIDADE_OFICIAL")
+NOME_FLUXO <- ifelse(params$usar_localidade_tratada, "TRATADA", "OFICIAL_PRIORIDADE_IBGE")
+
+# 5.1. Preparação de Dados Comuns
+total_enderecos_por_setor <- enderecos_setor %>%
+  count(SETOR_IBGE_VALIDADO, name = "total_enderecos")
+
+# 5.2. Estimar População
+
+# Código da Seção 5 (Com a correção de NOME_LOCALIDADE_FINAL)
+pop_localidade_final <- enderecos_setor %>%
+  mutate(NOME_LOCALIDADE_FINAL = .data[[COLUNA_LOCALIDADE_FINAL]]) %>%
+  # Aqui SITUACAO_SETOR existe, e o resultado do count tem:
+  # SETOR_IBGE_VALIDADO, NOME_LOCALIDADE_FINAL, DISTRITO_CENSO, SITUACAO_SETOR, n_enderecos
+  count(SETOR_IBGE_VALIDADO, NOME_LOCALIDADE_FINAL, DISTRITO_CENSO, SITUACAO_SETOR, name = "n_enderecos") %>%
+  
+  # O primeiro join não afeta a SITUACAO_SETOR
+  left_join(total_enderecos_por_setor, by = "SETOR_IBGE_VALIDADO") %>%
+  
+# O segundo join: *** CORREÇÃO AQUI ***
+  # Inclua SITUACAO_SETOR na cláusula 'by' para evitar o conflito de nomes e forçar o matching
+  left_join(pop_setor, by = c("SETOR_IBGE_VALIDADO", "SITUACAO_SETOR")) %>%
+  # ... (resto do pipeline)
+  mutate(pop_estimada = round((n_enderecos / total_enderecos) * as.numeric(v0001), 0)) %>%
+  
+  # Sumarização Final
+  group_by(NOME_LOCALIDADE_FINAL, DISTRITO_CENSO, SITUACAO_SETOR) %>%
+  summarise(pop_total_estimada = sum(pop_estimada, na.rm = TRUE), .groups = 'drop') %>%
+  arrange(desc(pop_total_estimada))
+```
+
+## População Estimada por Localidade (Tabela HTML)
+
+```{r}
+library(knitr)
+# 1. Formata a coluna populacional para melhor apresentação visual (com separador de milhar)
+pop_localidade_final_formatted <- pop_localidade_final %>%
+  # Usa scales::comma para formatar os números de população com pontos e vírgulas (padrão BR)
+  mutate(
+    População_Estimada = scales::comma(pop_total_estimada, big.mark = ".", decimal.mark = ",")
+  ) %>%
+  # Seleciona e renomeia as colunas finais para o cabeçalho da tabela
+  select(
+    Localidade = NOME_LOCALIDADE_FINAL,
+    Distrito = DISTRITO_CENSO,
+    Situação = SITUACAO_SETOR,
+    População_Estimada
+  )
+
+# 2. Usa knitr::kbl para criar uma tabela HTML apresentável
+kable(
+  pop_localidade_final_formatted,
+  caption = "População Total Estimada por Localidade",
+  align = c('l', 'l', 'l', 'r') 
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+## Exportar resultados
+
+Nesta etapa, o resultado final da estimativa populacional (a tabela `pop_localidade_final`) é exportado para um arquivo **Excel (`.xlsx`)**, que pode ser utilizado para relatórios e análises externas.
+
+```{r}
+# Concatena o caminho da pasta com o nome do arquivo
+nome_saida <- file.path(PASTA_SAIDA, paste0("populacao_por_localidade_", NOME_FLUXO, "_", COD_MUN, ".xlsx"))
+write.xlsx(pop_localidade_final, nome_saida)
+
+cat(paste0("Arquivo exportado com sucesso: ", nome_saida))
+```
+
+## 7. Gerar malha de localidades
+
+Esta seção é responsável pela preparação geográfica para a visualização. Ela dissolve as fronteiras dos setores censitários que pertencem à mesma Localidade, criando polígonos maiores que representam os **Limites das Localidades** conforme a distribuição dos endereços e a regra de prioridade estabelecida. O resultado (`malha_localidades_final`) é exportado como um **Shapefile** e utilizado para o mapa de fronteiras.
+
+```{r fig.width=10, fig.height=8}
+# 7.1. Gerar Malha Geográfica da Localidade Escolhida
+mapa_setor_localidade_data <- enderecos_setor %>%
+  # CORREÇÃO: Usa all_of() para seleção dinâmica no select()
+  select(SETOR_IBGE_VALIDADO, all_of(COLUNA_LOCALIDADE_FINAL), DISTRITO_CENSO) %>%
+  distinct() %>%
+  # CORREÇÃO: Usa all_of() para seleção dinâmica no rename()
+  rename(NOME_LOCALIDADE_FINAL = all_of(COLUNA_LOCALIDADE_FINAL)) %>%
+  # Junta a população, mas precisa primeiro somar a população total por Localidade/Distrito
+  left_join(
+    pop_localidade_final %>%
+      group_by(NOME_LOCALIDADE_FINAL, DISTRITO_CENSO) %>%
+      # Agrega a população total (Urbano + Rural) para o mapa
+      summarise(pop_total_estimada = sum(pop_total_estimada, na.rm = TRUE), .groups = 'drop'), 
+    by = c("NOME_LOCALIDADE_FINAL", "DISTRITO_CENSO")
+  )
+
+# 7.2. Juntar os Dados ao Objeto de Geometria 'setores'
+setores_com_dados <- setores %>%
+  rename(SETOR_IBGE_VALIDADO = CD_SETOR) %>%
+  left_join(mapa_setor_localidade_data, by = "SETOR_IBGE_VALIDADO") %>%
+  filter(!is.na(NOME_LOCALIDADE_FINAL)) 
+
+# 7.3. Dissolver/Agregar as Geometrias dos Setores (CORREÇÃO DO ERRO 'geometry' NÃO ENCONTRADO)
+malha_localidades_final <- setores_com_dados %>%
+  group_by(NOME_LOCALIDADE_FINAL, DISTRITO_CENSO) %>%
+  summarise(
+    pop_total_estimada = sum(pop_total_estimada, na.rm = TRUE),
+    geometry = st_union(geometry), 
+    .groups = 'drop'
+  )
+
+# =========================================================
+# *** EXPORTAR SHAPEFILE DOS LIMITES ***
+# =========================================================
+# Concatena o caminho da pasta com o nome do arquivo
+nome_shp_saida <- file.path(PASTA_SAIDA, paste0("limites_localidades_", NOME_FLUXO, "_", COD_MUN, ".shp"))
+st_write(malha_localidades_final, nome_shp_saida, delete_layer = TRUE, quiet = TRUE)
+cat(paste0("Shapefile de limites exportado com sucesso: ", nome_shp_saida, "\n"))
+# =========================================================
+
+# 7.4. Plotar o Mapa (COM FOCO APENAS NAS DIVISÕES DE LOCALIDADE)
+
+malha_filtrada <- malha_localidades_final %>%
+  filter(pop_total_estimada > 0)
+
+# 1. Subconjunto para rótulos (as maiores localidades)
+labels_subset <- subset(malha_filtrada, pop_total_estimada > quantile(pop_total_estimada, 0.75))
+
+# 2. Projeta o subconjunto de rótulos para um CRS Planar (UTM 22S, EPSG: 31982)
+#    Garante o cálculo correto do centroide para os rótulos.
+labels_projected <- labels_subset %>% st_transform(31982) 
+
+ggplot(data = malha_filtrada) +
+  # *** CORREÇÃO AQUI: Removemos o 'fill' de aes() e definimos uma cor sólida ***
+  geom_sf(fill = "gray90", color = "black", linewidth = 0.5) +
+  
+  # *** REMOÇÃO: A escala de preenchimento (scale_fill_viridis_c) foi removida ***
+  
+  labs(
+    title = paste("Divisão das Localidades (Fronteiras)"),
+    subtitle = NOME_MUN,
+    caption = "Fonte: Dados IBGE, processamento estatístico Instituto Mapa."
+  ) +
+  theme_minimal() +
+  # 3. Adiciona um rótulo básico nas maiores localidades, usando os dados PROJETADOS
+  geom_sf_text(
+    data = labels_projected,
+    aes(label = NOME_LOCALIDADE_FINAL),
+    size = 2.5,
+    check_overlap = TRUE
+  )
+```
+
+## Mapa de Dispersão dos Endereços por Localidade
+
+Este capítulo visualiza a **Distribuição Espacial Bruta** de todos os endereços, agrupados por sua Localidade final. Cada ponto de endereço é plotado e colorido, e um **Centroide** é calculado para cada agrupamento, onde o nome da Localidade é rotulado. Este mapa ajuda a verificar a extensão geográfica de cada Localidade, independentemente das fronteiras formais do setor censitário
+
+```{r}
+# --- Diagnóstico de Leitura ---
+# Altere o caminho se necessário. Usamos o caminho parametrizado:
+caminho <- params$caminho_enderecos
+
+# Tenta ler com a configuração atual
+teste_leitura <- read_delim(caminho, delim = ";", n_max = 5, 
+                            locale = locale(encoding = "Latin1", decimal_mark = ",", grouping_mark = "."),
+                            col_types = cols(.default = col_character()))
+
+
+```
+
+```{r fig.width=12, fig.height=10}
+# 1. Preparar o objeto SF dos endereços usando a LOCALIDADE FINAL escolhida
+#    Usamos a coluna LATITUDE/LONGITUDE original do enderecos_setor
+enderecos_sf_plot <- enderecos_setor %>%
+  # Seleciona apenas as colunas necessárias para o plot de pontos
+  select(LATITUDE, LONGITUDE, NOME_LOCALIDADE_FINAL = all_of(COLUNA_LOCALIDADE_FINAL)) %>%
+  # Converte o dataframe para um objeto SF para calcular o centroide
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4674) %>%
+  # Remove NAs para garantir um plot limpo
+  filter(!is.na(NOME_LOCALIDADE_FINAL))
+
+# 2. Calcular o Centroide (Ponto Central) para cada Localidade
+centroides_localidades <- enderecos_sf_plot %>%
+  # Agrupa por Localidade Final
+  group_by(NOME_LOCALIDADE_FINAL) %>%
+  # Sumariza, calculando o centroide de todos os pontos daquele grupo
+  summarise(geometry = st_centroid(st_union(geometry)), .groups = 'drop') %>%
+  # Transforma para um CRS planar (UTM) para rótulos precisos
+  st_transform(31982)
+
+# 3. Preparar os dados de endereço para plotagem (opcionalmente projetados)
+#    Geralmente, plota-se no CRS geográfico (4674) para fundo de mapa,
+#    mas projetar os pontos pode ser útil para densidade.
+enderecos_sf_plot_proj <- enderecos_sf_plot %>% st_transform(31982)
+
+# 4. Criação do Mapa
+ggplot() +
+  # 4.1. Plotar todos os endereços como pontos, coloridos por Localidade
+  geom_sf(data = enderecos_sf_plot_proj, 
+          aes(color = NOME_LOCALIDADE_FINAL), 
+          size = 0.5, 
+          alpha = 0.6) +
+  
+  # 4.2. Adicionar os rótulos no centroide
+  geom_sf_text(data = centroides_localidades, 
+               aes(label = NOME_LOCALIDADE_FINAL), 
+               color = "black", 
+               size = 3, 
+               fontface = "bold",
+               check_overlap = TRUE) +
+  
+  # 4.3. Adicionar pontos centrais brancos (para destacar o centroide)
+  geom_sf(data = centroides_localidades, 
+          size = 2.5, 
+          color = "white") +
+  
+  scale_color_discrete(name = "Localidade") + # Legenda de cores
+  
+  labs(
+    title = paste("Dispersão dos Endereços Agrupados por Localidade - Fluxo:", NOME_FLUXO),
+    subtitle = paste(NOME_MUN, "- Distribuição espacial baseada nos dados de endereço."),
+    caption = "Ponto de rótulo é o centroide (ponto médio) dos endereços da localidade."
+  ) +
+  theme_minimal() +
+  # Remover eixos de coordenadas
+  theme(axis.text = element_blank(), 
+        axis.ticks = element_blank())
+```
+
+## Resumo final dos indicadores
+
+Este capítulo apresenta um **painel executivo** comparando a população total oficial do Censo (base) com a população total estimada pelo modelo. O objetivo é fornecer uma visão geral da qualidade da estimativa, calculando a **porcentagem de população não estimada (perda)** e a distribuição Urbana/Rural da população base do Censo.
+
+```{r resultados, results='asis'}
+# Garante que v0001 é numérico no pop_setor
+pop_setor_clean <- pop_setor %>%
+  mutate(v0001_num = as.numeric(v0001))
+
+# 1. População Total dos Setores Censitários (População Censo)
+pop_total_censo <- sum(pop_setor_clean$v0001_num, na.rm = TRUE)
+
+# 2. População Urbana e Rural dos Setores Censitários
+pop_urbana_censo <- pop_setor_clean %>%
+  filter(SITUACAO_SETOR == "Urbana") %>%
+  summarise(total = sum(v0001_num, na.rm = TRUE)) %>%
+  pull(total)
+
+pop_rural_censo <- pop_setor_clean %>%
+  filter(SITUACAO_SETOR == "Rural") %>%
+  summarise(total = sum(v0001_num, na.rm = TRUE)) %>%
+  pull(total)
+
+# 3. População Total Estimada (População Endereços)
+pop_total_estimada <- sum(pop_localidade_final$pop_total_estimada, na.rm = TRUE)
+
+# 4. Cálculos de Porcentagem
+perc_urbana <- round((pop_urbana_censo / pop_total_censo) * 100, 2)
+perc_rural <- round((pop_rural_censo / pop_total_censo) * 100, 2)
+
+# 5. Porcentagem de População Não Estimada
+pop_nao_estimada <- pop_total_censo - pop_total_estimada
+perc_nao_estimada <- round((pop_nao_estimada / pop_total_censo) * 100, 2)
+
+# --- 1. Cria o dataframe de Totais Populacionais ---
+# Usa scales::comma para formatar os números para visualização
+df_totais <- data.frame(
+  Métrica = c(
+    "População Total (Censo IBGE)",
+    "População Total Estimada (Modelo)",
+    "População Não Estimada (Perda)"
+  ),
+  Valor = c(
+    scales::comma(pop_total_censo, big.mark = ".", decimal.mark = ","),
+    scales::comma(pop_total_estimada, big.mark = ".", decimal.mark = ","),
+    scales::comma(pop_nao_estimada, big.mark = ".", decimal.mark = ",")
+  ),
+  stringsAsFactors = FALSE
+)
+
+# --- 2. Cria o dataframe de Porcentagens ---
+df_percentuais <- data.frame(
+  Métrica = c(
+    "Percentual Não Estimado (Perda)",
+    "População Urbana (Censo Base)",
+    "População Rural (Censo Base)"
+  ),
+  Valor = c(
+    paste0(perc_nao_estimada, " %"),
+    paste0(perc_urbana, " %"),
+    paste0(perc_rural, " %")
+  ),
+  stringsAsFactors = FALSE
+)
+
+# --- 3. Renderiza os Resultados em HTML ---
+
+#cat("### Resultados do Levantamento de População por Localidade\n\n")
+#cat(paste("Município:", NOME_MUN, "\n\n"))
+
+# 3.1. Renderiza a Tabela de Totais
+#cat("#### Totais Populacionais\n")
+knitr::kable(
+  df_totais,
+  caption = "Comparativo População Censo vs. Estimada",
+  align = c('l', 'r') # Alinha texto à esquerda, números à direita
+)
+
+# 3.2. Renderiza a Tabela de Porcentagens
+#cat("\n#### Detalhamento Percentual\n")
+knitr::kable(
+  df_percentuais,
+  caption = "Percentuais de Cobertura e Distribuição Censo",
+  align = c('l', 'r')
+)
+```
